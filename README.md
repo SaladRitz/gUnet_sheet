@@ -2,7 +2,7 @@
 #Total of 3 lines of code to be edited in order to use the code. Details shown below.
 
 
-##After uploading dataset input set dataset variables inside the code like this:
+##After uploading dataset input, set dataset variables inside the code like this:
 
 args.train_set = '/kaggle/input/haze4k-t'  # training dataset path
 args.val_set = '/kaggle/input/haze4k-v'    # validation dataset path
