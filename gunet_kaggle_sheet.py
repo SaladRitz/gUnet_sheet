@@ -1,3 +1,9 @@
+!pip install pytorch==1.12 torchvision torchaudio cudatoolkit==11.3
+!pip install timm==0.6.5
+!pip install pytorch-msssim
+!pip install opencv-python==4.5.5.62
+!pip install tqdm tensorboard tensorboardx
+
 import os
 import argparse
 import json
@@ -22,6 +28,11 @@ from torchvision.utils import save_image
 import subprocess
 import time
 import numpy as np
+import shutil
+
+
+
+
 
 
 #--------------------------------------------------UTILS FOLDER--------------------------------------------------------------------
@@ -49,6 +60,8 @@ class CosineScheduler(Scheduler):
         assert value_min >= 0
         assert warmup_t >= 0
         assert const_t >= 0
+        
+        #self.t_max = t_max 
 
         self.cosine_t = t_max - warmup_t - const_t
         self.value_min = value_min
@@ -80,7 +93,8 @@ class CosineScheduler(Scheduler):
 
     def get_epoch_values(self, epoch: int):
         return self._get_value(epoch)
-    
+
+
     def _get_lr(self):
         #Compute the learning rate for the current epoch.
         if self.last_epoch < self.warmup_t:
@@ -95,9 +109,6 @@ class CosineScheduler(Scheduler):
         lr = self.value_min + 0.5 * (self.base_lrs[0] - self.value_min) * (1 + torch.cos(progress * 3.141592653589793))
     
         return [lr for _ in self.optimizer.param_groups]
-	
-
-
 
 
 
@@ -125,6 +136,9 @@ def pad_img(x, patch_size):
 	mod_pad_w = (patch_size - w % patch_size) % patch_size
 	x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
 	return x
+
+
+
 
 
 
@@ -246,7 +260,6 @@ class PairLoader(Dataset):
 		return {'source': source_tensor, 'target': target_tensor, 'filename': img_name}
 
 #----------------------------------------------------------------------------------------------------------------------------------
-
 
 
 
@@ -480,7 +493,22 @@ def gunet_d():	# 4 cards 3090
 
 
 def convert_model(module):
+    """Traverse the input module and its child recursively
+       and replace all instance of torch.nn.modules.batchnorm.BatchNorm*N*d
+       to SynchronizedBatchNorm*N*d
 
+    Args:
+        module: the input module needs to be convert to SyncBN model
+
+    Examples:
+        >>> import torch.nn as nn
+        >>> import torchvision
+        >>> # m is a standard pytorch model
+        >>> m = torchvision.models.resnet18(True)
+        >>> m = nn.DataParallel(m)
+        >>> # after convert, m is using SyncBN
+        >>> m = convert_model(m)
+    """
     if isinstance(module, torch.nn.DataParallel):
         mod = module.module
         mod = convert_model(mod)
@@ -510,7 +538,18 @@ def convert_model(module):
 
 
 class DataParallelWithCallback(DataParallel):
+    """
+    Data Parallel with a replication callback.
 
+    An replication callback `__data_parallel_replicate__` of each module will be invoked after being created by
+    original `replicate` function.
+    The callback will be invoked with arguments `__data_parallel_replicate__(ctx, copy_id)`
+
+    Examples:
+        > sync_bn = SynchronizedBatchNorm1d(10, eps=1e-5, affine=False)
+        > sync_bn = DataParallelWithCallback(sync_bn, device_ids=[0, 1])
+        # sync_bn.__data_parallel_replicate__ will be invoked.
+    """
 
     def replicate(self, module, device_ids):
         modules = super(DataParallelWithCallback, self).replicate(module, device_ids)
@@ -519,7 +558,18 @@ class DataParallelWithCallback(DataParallel):
 	
 
 def execute_replication_callbacks(modules):
+    """
+    Execute an replication callback `__data_parallel_replicate__` on each module created by original replication.
 
+    The callback will be invoked with arguments `__data_parallel_replicate__(ctx, copy_id)`
+
+    Note that, as all modules are isomorphism, we assign each sub-module with a context
+    (shared among multiple copies of this module on different devices).
+    Through this context, different copies can share some information.
+
+    We guarantee that the callback on the master copy (the first copy) will be called ahead of calling the callback
+    of any slave copies.
+    """
     master_copy = modules[0]
     nr_modules = len(list(master_copy.modules()))
     ctxs = [CallbackContext() for _ in range(nr_modules)]
@@ -531,6 +581,7 @@ def execute_replication_callbacks(modules):
 
 class CallbackContext(object):
     pass
+
 
 
 #                                               BATCHNORM.PY IN SYNC_BATCHNORM FOLDER
@@ -578,6 +629,11 @@ def _unsqueeze_ft(tensor):
 
 _ChildMessage = collections.namedtuple('_ChildMessage', ['sum', 'ssum', 'sum_size'])
 _MasterMessage = collections.namedtuple('_MasterMessage', ['sum', 'inv_std'])
+
+
+
+
+
 
 
 class _SynchronizedBatchNorm(_BatchNorm):
@@ -764,6 +820,16 @@ class SlavePipe(_SlavePipeBase):
 
 
 class SyncMaster(object):
+    """An abstract `SyncMaster` object.
+
+    - During the replication, as the data parallel will trigger an callback of each module, all slave devices should
+    call `register(id)` and obtain an `SlavePipe` to communicate with the master.
+    - During the forward pass, master device invokes `run_master`, all messages from slave devices will be collected,
+    and passed to a registered callback.
+    - After receiving the messages, the master device should gather the information and determine to message passed
+    back to each slave devices.
+    """
+
     def __init__(self, master_callback):
         """
 
@@ -800,7 +866,19 @@ class SyncMaster(object):
         return SlavePipe(identifier, self._queue, future)
 
     def run_master(self, master_msg):
+        """
+        Main entry for the master device in each forward pass.
+        The messages were first collected from each devices (including the master device), and then
+        an callback will be invoked to compute the message to be sent back to each devices
+        (including the master device).
 
+        Args:
+            master_msg: the message that the master want to send to itself. This will be placed as the first
+            message when calling `master_callback`. For detailed usage, see `_SynchronizedBatchNorm` for an example.
+
+        Returns: the message to be sent back to the master device.
+
+        """
         self._activated = True
 
         intermediates = [(0, master_msg)]
@@ -824,7 +902,14 @@ class SyncMaster(object):
     def nr_slaves(self):
         return len(self._registry)
 
-#-------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
 #GPU Config
 # Automatically use GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -842,27 +927,29 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
 torch.cuda.empty_cache()
 torch.cuda.ipc_collect()
 
-
+import argparse
+import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='gunet_t', type=str, help='model name')
 parser.add_argument('--num_workers', default=16, type=int, help='number of workers')
 parser.add_argument('--use_mp', action='store_true', default=False, help='use Mixed Precision')
 parser.add_argument('--use_ddp', action='store_true', default=False, help='use Distributed Data Parallel')
-parser.add_argument('--save_dir', default='./saved_models/', type=str, help='path to models saving')
+#parser.add_argument('--save_dir', default='./saved_models/', type=str, help='path to models saving')
+parser.add_argument('--save_dir', default='/kaggle/working/saved_models/', type=str, help='path to models saving')
 #parser.add_argument('--data_dir', default='./data/', type=str, help='path to dataset')   # Keep the base data path
-parser.add_argument('--data_dir', default='C:/Users/ritan/OneDrive/Desktop/Original_gUNET/gUNET/data/', type=str, help='path to dataset')
+parser.add_argument('--data_dir', default='/kaggle/input/', type=str, help='path to dataset')
 parser.add_argument('--log_dir', default='./logs/', type=str, help='path to logs')
 
 # Update dataset names to match your folder structure
-parser.add_argument('--train_set', default='Haze4K-T', type=str, help='train dataset name')   # Train dataset
-parser.add_argument('--val_set', default='Haze4K-V', type=str, help='valid dataset name')     # Validation dataset
+parser.add_argument('--train_set', default='haze4k-t/Haze4K-T', type=str, help='train dataset name')   # Train dataset
+parser.add_argument('--val_set', default='haze4k-v/Haze4K-V', type=str, help='valid dataset name')     # Validation dataset
 
 # Experiment settings
 parser.add_argument('--exp', default='reside-in', type=str, help='experiment setting')
 
-args = parser.parse_args()
-
+#args = parser.parse_args()
+args, _ = parser.parse_known_args()
 
 # training environment
 if args.use_ddp:
@@ -878,20 +965,20 @@ else:
 # training config
 
 b_setup = {
-    "t_patch_size": 128,             # Reduced patch size to reduce VRAM usage
+    "t_patch_size": 256,             
     "valid_mode": "valid",
-    "v_patch_size": 256,             # Smaller validation patches
-    "v_batch_ratio": 0.5,
+    "v_patch_size": 400,             
+    "v_batch_ratio": 1.0,
     "edge_decay": 0.1,
     "weight_decay": 0.01,
     "data_augment": True,
     "cache_memory": False,
-    "num_iter": 8192,                # Reduced iterations
-    "epochs": 500,                   # Fewer epochs
-    "warmup_epochs": 10,             # Fewer warmup epochs
+    "num_iter": 16384,                
+    "epochs": 1000,                   
+    "warmup_epochs": 50,             
     "const_epochs": 0,
-    "frozen_epochs": 100,
-    "eval_freq": 5                    # More frequent evaluation
+    "frozen_epochs": 200,
+    "eval_freq": 10                    
 }
 
 variant = args.model.split('_')[-1]
@@ -917,6 +1004,10 @@ def train(train_loader, network, criterion, optimizer, scaler, epochs, frozen_bn
 	
 	network.eval() if frozen_bn else network.train()	# simplified implementation that other modules may be affected
 	
+
+#	for batch in enumerate(train_loader):
+#		source_img = batch['source'].cuda()
+#		target_img = batch['target'].cuda()
 	batch_count = 0  # ✅ Counter to track batch index
 	for batch in train_loader:
 		batch_count += 1  # ✅ Increment batch counter manually
@@ -939,6 +1030,10 @@ def train(train_loader, network, criterion, optimizer, scaler, epochs, frozen_bn
 		if args.use_ddp: loss = reduce_mean(loss, dist.get_world_size())
 		losses.update(loss.item())
 
+#		# Show images during training
+#		if batch % 10 == 0:
+#			show_images(source_img, target_img, output, epochs, batch)
+
         # ✅ Automatically plot and save images every `plot_interval` batches
 		if batch_count % plot_interval == 0:
 			#print(f"\n🛠️ Plotting images at Epoch {epochs}, Batch {batch_count}...")
@@ -948,11 +1043,13 @@ def train(train_loader, network, criterion, optimizer, scaler, epochs, frozen_bn
 
 	return losses.avg
 
+
+
 # New Validation loss function
 
 from skimage.metrics import structural_similarity as compare_ssim
 import torch.nn.functional as F
-
+'''
 def valid(val_loader, network, criterion):
     """Returns (avg_psnr, avg_ssim, avg_val_loss) over val_loader."""
     psnr_meter = AverageMeter()
@@ -1004,6 +1101,84 @@ def valid(val_loader, network, criterion):
         ssim_meter.update(ssim_batch, src.size(0))
 
     return psnr_meter.avg, ssim_meter.avg, loss_meter.avg
+
+'''
+def valid(val_loader, network, criterion):
+    """Returns (avg_psnr, avg_ssim, avg_val_loss) over val_loader."""
+    psnr_meter = AverageMeter()
+    loss_meter = AverageMeter()
+    ssim_meter = AverageMeter()
+
+    torch.cuda.empty_cache()
+    network.eval()
+
+    for batch in val_loader:
+        src = batch['source'].to('cuda')
+        tgt = batch['target'].to('cuda')
+
+        with torch.no_grad():
+            H, W = src.shape[2:]
+            pad = (network.module.patch_size
+                   if hasattr(network.module, 'patch_size')
+                   else 16)
+            src_p = pad_img(src, pad)
+            out = network(src_p).clamp_(-1, 1)
+            out = out[:, :, :H, :W]
+
+        # 1) compute and record L1 loss
+        val_loss = criterion(out, tgt).item()
+        loss_meter.update(val_loss, src.size(0))
+
+        # 2) compute and record PSNR
+        mse_per_image = F.mse_loss(out * 0.5 + 0.5,
+                                   tgt * 0.5 + 0.5,
+                                   reduction='none') \
+                         .mean((1, 2, 3))
+        psnr_batch = (10 * torch.log10(1 / mse_per_image)).mean().item()
+        psnr_meter.update(psnr_batch, src.size(0))
+
+        # 3) compute and record SSIM per image
+        out_np = (out * 0.5 + 0.5).cpu().numpy()  # shape: (N, C, H, W)
+        tgt_np = (tgt * 0.5 + 0.5).cpu().numpy()
+        batch_ssim = 0.0
+
+        for i in range(out_np.shape[0]):
+            img = out_np[i]
+            ref = tgt_np[i]
+            C, h, w = img.shape
+
+            # pick an odd window size between 3 and min(h, w)
+            win_size = min(h, w)
+            if win_size % 2 == 0:
+                win_size -= 1
+            win_size = max(win_size, 3)
+
+            # prepare HxW or HxWxC array
+            img_hw = img.transpose(1, 2, 0)
+            ref_hw = ref.transpose(1, 2, 0)
+
+            if C == 1:
+                # squeeze singleton channel for grayscale
+                img_hw = img_hw[:, :, 0]
+                ref_hw = ref_hw[:, :, 0]
+                channel_axis = None
+            else:
+                channel_axis = -1
+
+            s = compare_ssim(
+                img_hw,
+                ref_hw,
+                data_range=1.0,
+                win_size=win_size,
+                channel_axis=channel_axis
+            )
+            batch_ssim += s
+
+        ssim_batch = batch_ssim / out_np.shape[0]
+        ssim_meter.update(ssim_batch, src.size(0))
+
+    return psnr_meter.avg, ssim_meter.avg, loss_meter.avg
+
 
 
 
@@ -1059,97 +1234,171 @@ def show_images(orig, target, output, epoch, batch, save_dir="./plots", display_
     plt.ioff()  # Disable interactive mode
 
 
-def main():
 
-    # Create history tracker
+
+
+def find_latest_checkpoint(model_name, save_dir):
+	files = [f for f in os.listdir(save_dir) if f.startswith(model_name) and 'epoch' in f and f.endswith('.pth')]
+	if not files:
+		return None
+	files.sort(key=lambda f: int(re.findall(r'epoch(\d+)', f)[0]))
+	return os.path.join(save_dir, files[-1])
+
+def resume_or_initialize(model, optimizer, lr_scheduler, wd_scheduler, scaler, save_dir, model_name):
+	checkpoint_path = find_latest_checkpoint(model_name, save_dir)
+	if checkpoint_path is None:
+		print("🆕 No checkpoint found. Starting fresh.")
+		history = {'epoch': [], 'train_loss': [], 'val_loss': [], 'psnr': [], 'ssim': []}
+		return 0, 0, history
+	else:
+		print(f"🔁 Resuming from checkpoint: {checkpoint_path}")
+		checkpoint = torch.load(checkpoint_path, map_location='cpu')
+		model.load_state_dict(checkpoint['state_dict'])
+		optimizer.load_state_dict(checkpoint['optimizer'])
+		lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+		wd_scheduler.load_state_dict(checkpoint['wd_scheduler'])
+		scaler.load_state_dict(checkpoint['scaler'])
+		history = checkpoint.get('history', {'epoch': [], 'train_loss': [], 'val_loss': [], 'psnr': [], 'ssim': []})
+		return checkpoint['cur_epoch'], checkpoint['best_psnr'], history
+
+
+
+
+
+
+
+
+
+
+
+
+def main():
+    import os
+    import glob
+    import zipfile
+    import shutil
+    import pandas as pd
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.nn.parallel import DataParallel, DistributedDataParallel
+    from torch.utils.data import DataLoader, RandomSampler
+    from torch.utils.tensorboard import SummaryWriter
+    from torch.cuda.amp import GradScaler
+    from tqdm import tqdm
+
+    # 1) Set up save directory under Kaggle working
+    save_dir = '/kaggle/working/saved_models'
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 2) Unzip any uploaded checkpoint zips into save_dir
+    for z in glob.glob('/kaggle/input/*.zip'):
+        with zipfile.ZipFile(z, 'r') as zip_ref:
+            zip_ref.extractall(save_dir)
+    # Also copy .pth checkpoints from all datasets (not zipped)
+    for root, dirs, files in os.walk('/kaggle/input/'):
+        for f in files:
+            if f.endswith('.pth'):
+                full_path = os.path.join(root, f)
+                print("Found checkpoint:", full_path)
+                shutil.copy(full_path, save_dir)
+
+    # 3) History for CSV
     history = {'epoch': [], 'train_loss': [], 'val_loss': [], 'psnr': [], 'ssim': []}
 
-    # Initialize model
-    network = eval(args.model)()
-    network.to('cuda')
-
+    # 4) Build model
+    network = eval(args.model)().cuda()
     if args.use_ddp:
         network = DistributedDataParallel(network, device_ids=[local_rank], output_device=local_rank)
         if m_setup['batch_size'] // world_size < 16:
             if local_rank == 0:
-                print('==> Using SyncBN because of too small norm-batch-size.')
+                print('==> Using SyncBN (small batch per GPU)')
             nn.SyncBatchNorm.convert_sync_batchnorm(network)
     else:
         network = DataParallel(network)
         if m_setup['batch_size'] // torch.cuda.device_count() < 16:
-            print('==> Using SyncBN because of too small norm-batch-size.')
+            print('==> Using SyncBN (small batch overall)')
             convert_model(network)
 
-    # Define loss, optimizer, schedulers
+    # 5) Loss, optimizer, schedulers, scaler
     criterion = nn.L1Loss()
-    optimizer = torch.optim.AdamW(network.parameters(), lr=m_setup['lr'], weight_decay=b_setup['weight_decay'])
-    lr_scheduler = CosineScheduler(optimizer, param_name='lr', t_max=b_setup['epochs'], value_min=m_setup['lr'] * 1e-2,
-                                   warmup_t=b_setup['warmup_epochs'], const_t=b_setup['const_epochs'])
-    wd_scheduler = CosineScheduler(optimizer, param_name='weight_decay', t_max=b_setup['epochs'])
+    optimizer = torch.optim.AdamW(network.parameters(), lr=m_setup['lr'],
+                                  weight_decay=b_setup['weight_decay'])
+    lr_scheduler = CosineScheduler(optimizer, param_name='lr',
+                                   t_max=b_setup['epochs'],
+                                   value_min=m_setup['lr'] * 1e-2,
+                                   warmup_t=b_setup['warmup_epochs'],
+                                   const_t=b_setup['const_epochs'])
+    wd_scheduler = CosineScheduler(optimizer, param_name='weight_decay',
+                                   t_max=b_setup['epochs'])
     scaler = GradScaler()
 
-    # Load checkpoint if exists
-    save_dir = os.path.join(args.save_dir, args.exp)
-    os.makedirs(save_dir, exist_ok=True)
+    # 6) Resume logic: find latest checkpoint
 
-    if not os.path.exists(os.path.join(save_dir, args.model + '.pth')):
-        best_psnr = 0
-        cur_epoch = 0
+    def latest_ckpt(save_dir, model_name):
+        snaps = sorted(
+            glob.glob(os.path.join(save_dir, f"{model_name}_epoch*.pth")),
+            key=lambda f: int(os.path.splitext(f)[0].split('epoch')[-1])
+        )
+        return snaps[-1] if snaps else None
+
+    ckpt = latest_ckpt(save_dir, args.model)
+    if ckpt:
+        print(f"==> Resuming from checkpoint {ckpt}")
+        #m = torch.load(ckpt, map_location='cpu')
+        m = torch.load(ckpt, map_location='cpu', weights_only=False)
+
+        network.load_state_dict(m['state_dict'])
+        optimizer.load_state_dict(m['optimizer'])
+        lr_scheduler.load_state_dict(m['lr_scheduler'])
+        wd_scheduler.load_state_dict(m['wd_scheduler'])
+        scaler.load_state_dict(m['scaler'])
+        cur_epoch = m.get('cur_epoch', 0)
+        best_psnr = m.get('best_psnr', 0)
+        history = m.get('history', history)
     else:
-        if not args.use_ddp or local_rank == 0:
-            print('==> Loaded existing trained model.')
-        model_info = torch.load(os.path.join(save_dir, args.model + '.pth'), map_location='cpu')
-        network.load_state_dict(model_info['state_dict'])
-        optimizer.load_state_dict(model_info['optimizer'])
-        lr_scheduler.load_state_dict(model_info['lr_scheduler'])
-        wd_scheduler.load_state_dict(model_info['wd_scheduler'])
-        scaler.load_state_dict(model_info['scaler'])
-        cur_epoch = model_info['cur_epoch']
-        best_psnr = model_info['best_psnr']
-
-    # Data loaders
+        print("==> No checkpoint found, starting fresh")
+        cur_epoch = 0
+        best_psnr = 0
+    # 7) Data loaders
     train_dataset = PairLoader(os.path.join(args.data_dir, args.train_set), 'train',
-                               b_setup['t_patch_size'],
-                               b_setup['edge_decay'],
-                               b_setup['data_augment'],
-                               b_setup['cache_memory'])
-
+                               b_setup['t_patch_size'], b_setup['edge_decay'],
+                               b_setup['data_augment'], b_setup['cache_memory'])
     train_loader = DataLoader(train_dataset,
                               batch_size=2,
-                              sampler=RandomSampler(train_dataset, num_samples=b_setup['num_iter'] // world_size),
-                              num_workers=4,
-                              pin_memory=True,
-                              drop_last=True,
-                              persistent_workers=True)
+                              sampler=RandomSampler(train_dataset,
+                                                    num_samples=b_setup['num_iter']//world_size),
+                              num_workers=4, pin_memory=True,
+                              drop_last=True, persistent_workers=True)
 
-    val_dataset = PairLoader(os.path.join(args.data_dir, args.val_set), b_setup['valid_mode'], b_setup['v_patch_size'])
+    val_dataset = PairLoader(os.path.join(args.data_dir, args.val_set),
+                             b_setup['valid_mode'], b_setup['v_patch_size'])
     val_loader = DataLoader(val_dataset,
-                            batch_size=max(int(m_setup['batch_size'] * b_setup['v_batch_ratio'] // world_size), 1),
-                            num_workers=args.num_workers // world_size,
+                            batch_size=max(int(m_setup['batch_size'] *
+                                               b_setup['v_batch_ratio']//world_size), 1),
+                            num_workers=args.num_workers//world_size,
                             pin_memory=True)
 
-    # TensorBoard
+    # 8) TensorBoard
     if not args.use_ddp or local_rank == 0:
-        print('==> Start training, current model name: ' + args.model)
+        print('==> Start training:', args.model)
         writer = SummaryWriter(log_dir=os.path.join(args.log_dir, args.exp, args.model))
 
-    # Training Loop
-    for epoch in tqdm(range(cur_epoch, b_setup['epochs'] + 1)):
+    # 9) Training loop
+    for epoch in tqdm(range(cur_epoch, b_setup['epochs']+1)):
         frozen_bn = epoch > (b_setup['epochs'] - b_setup['frozen_epochs'])
-
-        # Train step
+        # **Train**
         loss = train(train_loader, network, criterion, optimizer, scaler, epoch, frozen_bn)
-        lr_scheduler.step(epoch + 1)
-        wd_scheduler.step(epoch + 1)
+        lr_scheduler.step(epoch+1)
+        wd_scheduler.step(epoch+1)
 
-        # Log training loss
+        # record train loss
         history['epoch'].append(epoch)
         history['train_loss'].append(loss)
-
         if not args.use_ddp or local_rank == 0:
             writer.add_scalar('train_loss', loss, epoch)
 
-        # Validation and evaluation
+        # **Validate** every eval_freq
         if epoch % b_setup['eval_freq'] == 0:
             avg_psnr, avg_ssim, val_loss = valid(val_loader, network, criterion)
             history['val_loss'].append(val_loss)
@@ -1157,21 +1406,28 @@ def main():
             history['ssim'].append(avg_ssim)
 
             if not args.use_ddp or local_rank == 0:
+                # save best
                 if avg_psnr > best_psnr:
                     best_psnr = avg_psnr
                     torch.save({
-                        'cur_epoch': epoch + 1,
+                        'cur_epoch': epoch+1,
                         'best_psnr': best_psnr,
                         'state_dict': network.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
                         'wd_scheduler': wd_scheduler.state_dict(),
-                        'scaler': scaler.state_dict()
-                    }, os.path.join(save_dir, args.model + '.pth'))
+                        'scaler': scaler.state_dict(),
+                        'history': history
+                    }, os.path.join(save_dir, f"{args.model}.pth"))
+                    
+                    shutil.make_archive('/kaggle/working/saved_models', 'zip', '/kaggle/working/saved_models/')
 
-                if epoch % 50 == 0:
+
+                # periodic snapshot
+                if epoch % 30 == 0:
                     torch.save({
-                        'cur_epoch': epoch + 1,
+                        'cur_epoch': epoch+1,
+                        'best_psnr': best_psnr,
                         'state_dict': network.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'lr_scheduler': lr_scheduler.state_dict(),
@@ -1179,27 +1435,30 @@ def main():
                         'scaler': scaler.state_dict(),
                         'history': history
                     }, os.path.join(save_dir, f"{args.model}_epoch{epoch}.pth"))
+                    
+                    shutil.make_archive('/kaggle/working/saved_models', 'zip', '/kaggle/working/saved_models/')
+
 
                 writer.add_scalar('valid_psnr', avg_psnr, epoch)
-                writer.add_scalar('best_psnr', best_psnr, epoch)
-
+                writer.add_scalar('best_psnr',  best_psnr, epoch)
             if args.use_ddp:
-                dist.barrier()
+                torch.distributed.barrier()
         else:
-            # Align list size
+            # keep list alignment
             history['val_loss'].append(None)
             history['psnr'].append(None)
             history['ssim'].append(None)
 
-        # Save training log CSV after every epoch
+        # **Dump CSV** every epoch
         if not args.use_ddp or local_rank == 0:
             df = pd.DataFrame(history)
-            df.to_csv(os.path.join(save_dir, args.model + "_training_log.csv"), index=False)
-            print(history)
+            df.to_csv(os.path.join(save_dir, f"{args.model}_training_log.csv"), index=False)
 
-    # Final message
+    # 10) Done
     if not args.use_ddp or local_rank == 0:
         print("Done. Training log & checkpoints saved.")
-        
+
 if __name__ == '__main__':
-	main()
+    main()
+
+
