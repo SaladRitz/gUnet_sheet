@@ -1,13 +1,15 @@
 # gUnet_sheet
-#Total of 3 lines of code to be edited in order to use the code. Details shown below.
 
 
-##After uploading dataset input, set dataset variables inside the code like this:
+##Go to kaggle input section --> click on upload --> go to new dataset --> upload the saved_models.zip file --> set dataset name as your choice --> Create Dataset
 
-args.train_set = '/kaggle/input/haze4k-t'  # training dataset path
-args.val_set = '/kaggle/input/haze4k-v'    # validation dataset path
+Click save version button in kaggle so it runs in the cloud for a 12 hour session
+After 12 hours the output file will have a saved_models.zip file
+Download the saved_models.zip file
 
-##Go to kaggle input section --> click on upload --> go to new model --> upload the gunet_t.pth file --> put desired model name --> select pytprch as framework --> Select license as MIT -->upload model --> select and copy newly uploaded model folder path and put in place of the value of the variable args.load_dir inside the code as shown below.
+For the next 12 hour session, Delete the previous dataset that u had created in the input section. Create a new dataset in the input section and upload the saved_models.zip file that u downloaded from the output section of the previous session.
 
-args.load_dir= '/kaggle/input/gunet_t/pytorch/default/1/'
+Reapeat the process untill 1000 epochs are reached
+
+
 
